@@ -1,0 +1,536 @@
+---
+title: "SNA"
+author: "Hanna Lee and Qiwei Lin"
+date: "12/09/2021"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+# External Requirement
+
+```{r}
+library(tidyverse)
+library(nberwp)
+library(gender)
+library(igraph)
+library(network)
+library(intergraph)
+library(ggraph)
+library(tidygraph)
+library(GGally)
+library(influenceR)
+```
+
+```{r}
+# load NBER data
+data(paper_authors)
+data(authors)
+data(papers)
+data('paper_programs')
+```
+
+```{r}
+# preprocessing to include development economics papers
+dev_paper_author <- 
+  papers %>% 
+  left_join(paper_programs, by = "paper") %>% 
+  filter(program == "DEV") %>% 
+  left_join(paper_authors, by = "paper") %>% 
+  left_join(authors, by = "author") %>% 
+  arrange(desc(year), desc(month)) %>% 
+  select(paper, year, month, title, name)
+
+author_list <- dev_paper_author %>% 
+  distinct(name)
+
+#write.csv(author_list, file="author_list.csv", row.names = F)
+#write.csv(dev_paper_author, file="paper_author_list.csv", row.names = F)
+```
+
+
+# Network Setup
+
+```{r}
+# create two-mode networks: paper and authors
+edges <- dev_paper_author %>% 
+  select(paper, name)
+
+pap_aut_g <- graph.data.frame(edges)
+
+V(pap_aut_g)$type <- V(pap_aut_g)$name %in% dev_paper_author$name
+
+# project to one-mode network: coauthorship network (proj2)
+pap_aut_pr <- bipartite.projection(pap_aut_g)
+
+w_graph_paper <- pap_aut_pr$proj1
+w_graph_author <- pap_aut_pr$proj2
+```
+
+# Network Summary Statistics
+
+## Prepare Node Attributes for Authors
+
+```{r}
+# paper counts by authors
+pap_aut_count <- 
+  dev_paper_author %>% 
+  group_by(name) %>% 
+  count()
+```
+
+```{r}
+# set node attributes
+node_info <- data.frame(
+  deg = degree(w_graph_author)
+)
+node_info$name <- row.names(node_info)
+
+node_info <- 
+  node_info %>% 
+  left_join(pap_aut_count, by="name") %>% 
+  mutate(adj_deg = deg / n,
+         first_name = str_extract(name, pattern = "^[^\\s]+"),
+         gender = gender(first_name, method = "genderize")$gender)
+```
+
+```{r}
+# add new measures
+node_info <- 
+  node_info %>% 
+  mutate(btw = betweenness(w_graph_author, normalized = T, directed = F),
+         eigen = evcent(w_graph_author)$vector)
+```
+
+
+```{r}
+# calculate summary statistics for degree
+node_info_sub <-
+  node_info %>% 
+  filter(deg > 0) 
+summary(node_info_sub$deg)
+sd(node_info_sub$deg)
+```
+
+```{r}
+# identify the author with the highest degree
+top_scholars <- data.frame(
+  degree = node_info %>% slice_max(n = 10, deg) %>% pull(name),
+  btw = node_info %>% slice_max(n = 10, btw) %>% pull(name),
+  eigen = node_info %>% slice_max(n = 10, eigen) %>% pull(name)
+)
+top_scholars
+```
+
+```{r}
+# high betweenness
+node_info %>% slice_max(n = 10, btw) %>% 
+  select(name, btw)
+```
+
+```{r}
+# calculate increase in mean distance
+calculate_mean_dist <- function(n){
+  high_btw_scholars <- 
+    node_info_sub %>% slice_max(n = n, btw) %>% 
+    select(name, btw) %>% 
+    pull(name)
+  graph_author_wo_top <- induced_subgraph(w_graph_author_sub,
+                      V(w_graph_author_sub)[!name %in% high_btw_scholars])
+  new_mean <- mean_distance(graph_author_wo_top)
+  return(new_mean)
+}
+```
+
+```{r}
+dist_df <- data.frame(
+  n_scholars = seq(10, 500, 5)
+)
+dist_df$mean <- map_dbl(.x=dist_df$n_scholars, ~calculate_mean_dist(.x))
+```
+
+```{r}
+dist_df %>% 
+  slice_max(n=1, mean)
+```
+
+
+```{r, fig.height=6, fig.width=6}
+ggplot(dist_df, aes(n_scholars, mean)) + 
+  geom_line() +
+  labs(x = "The Number of Top Scholars (Betweenness Centrality) Removed",
+       y = "Mean Shortest Distance")
+       #title = "Mean Shortest Distance After Removing Top Scholars")
+ggsave(filename = "remove_dist.jpg")
+```
+
+```{r}
+# identify the author with the highest degree
+
+btw_df <- data.frame(
+  n_scholars = seq(10, 500, 5)
+)
+
+calculate_share <- function(n){
+  sum_top <- node_info %>% 
+    slice_max(n = n, btw) 
+    #ummarize(sum_btw = sum(btw)) / sum(node_info$btw)
+  share <- sum(sum_top$btw) / sum(node_info$btw)
+  return(share)
+}
+
+btw_df$share <- map_dbl(.x=btw_df$n_scholars, ~calculate_share(.x))
+```
+
+
+```{r, fig.height=6, fig.width=6}
+ggplot(btw_df, aes(n_scholars, share)) + 
+  geom_line() +
+  labs(x = "The Number of Top Scholars (Betweenness Centrality)",
+       y = "Share")
+       #title = "Share of Total Betweenness Centrality by Top Scholars")
+ggsave(filename = "Bwt-share.jpg")
+```
+
+
+```{r}
+# summary statistics
+summary(pap_aut_count$n)
+node_info %>% 
+  filter(deg >= 1) %>% 
+  pull(name) -> authors_w_collab
+dev_paper_author %>% 
+  filter(name %in% authors_w_collab) %>% 
+  group_by(paper) %>% 
+  summarize(n_author = n ()) %>% 
+  pull(n_author) %>% 
+  sd()
+
+dev_paper_author %>% 
+  filter(name %in% authors_w_collab) %>% 
+  group_by(name) %>% 
+  summarize(n_paper = n ()) %>% 
+  pull(n_paper) %>% 
+  sd()
+```
+
+## Edge Attribute
+
+```{r}
+# prepare edge attribute and adjusted co-authoring count
+# adjusted by the number of authors in the co-authored papers
+edge_names <- attributes(E(w_graph_author))$vnames
+E(w_graph_author)$name <- edge_names
+
+calculate_adj_measure <- function(df, name){
+  # identify author pairs
+  author_lst <- str_split(name, "\\|")[[1]]
+  author1 <- author_lst[[1]]
+  author2 <- author_lst[[2]]
+  
+  # identify co-authoring papers
+  co_paper <- dev_paper_author %>% 
+    filter(name %in% author_lst) %>%
+    count(paper) %>% 
+    filter(n >= 2) %>% 
+    pull(paper)
+  
+  # calculate the number of authors in each paper
+  n_coauthor <- dev_paper_author %>% 
+    filter(paper %in% co_paper) %>% 
+    group_by(paper) %>% 
+    summarize(n = n()) %>% 
+    filter(n >= 2)
+  # calcualte adjusted collaboration based on the size of co-authorship
+  measures <- sum(1/(n_coauthor$n - 1))
+  
+  return(measures)
+}
+```
+
+```{r}
+# calculate adjusted score 
+adj_score <- map_dbl(.x=edge_names, 
+                 ~calculate_adj_measure(df=dev_paper_author,
+                                        name=.x))
+E(w_graph_author)$adj_score <- adj_score
+```
+
+
+```{r}
+# identify the author pairs with the highest score
+idx_max <- which.max(E(w_graph_author)$adj_score)
+(max_edge <- E(w_graph_author)$adj_score[idx_max])
+E(w_graph_author)$name[idx_max]
+```
+
+```{r}
+edge_df <- data.frame(
+  name <- E(w_graph_author)$name,
+  score <- E(w_graph_author)$adj_score
+)
+
+edge_df %>% 
+  slice_max(n=5, score)
+```
+
+## Network-level Attributes
+
+```{r}
+# calculate various network-level attributes
+V(w_graph_author)$deg <- node_info$deg
+w_graph_author_sub <- induced_subgraph(w_graph_author,
+                                V(w_graph_author)$deg >= 1)
+
+summary(w_graph_author_sub)
+mean_distance(w_graph_author_sub, directed = F)
+edge_density(w_graph_author_sub)
+
+w_graph_author_sub %>% 
+  get.adjacency() %>% 
+  as.network() %>% 
+  as.sociomatrix() %>% 
+  sna::gtrans()
+
+table(node_info_sub$gender) / nrow(node_info_sub)
+
+node_info_sub %>% 
+  group(gender == "female") %>%
+  slice_min(n=10, constrain) %>% 
+  select(name, n, constrain)
+
+node_info_female <- node_info_sub %>% 
+  filter(gender == "female")
+node_info_male <- node_info_sub %>% 
+  filter(gender == "male")
+
+cor.test(node_info_male$constrain, node_info_male$n)
+cor.test(node_info_female$constrain, node_info_female$n)
+
+graphcomp <- components(w_graph_author_sub)
+summary(graphcomp$csize)
+sd(graphcomp$csize)
+max(graphcomp$csize) / length(V(w_graph_author_sub))
+```
+
+```{r}
+summary(node_info_sub$btw)
+sd(node_info_sub$btw)
+summary(node_info_sub$eigen)
+sd(node_info_sub$eigen)
+```
+
+
+# Legitimacy Theory
+
+```{r}
+# extract largest component 
+idx_max_comp <- which.max(graphcomp$csize)
+component_member <- graphcomp$membership == idx_max_comp
+largest_comp_coauthor <- induced_subgraph(w_graph_author_sub,
+                            V(w_graph_author_sub)[component_member])
+```
+
+```{r}
+# Burt Constrain
+tot_constraint_df <- data.frame(
+  names = names(constraint(largest_comp_coauthor)),
+  score = constraint(largest_comp_coauthor)
+)
+
+tot_constraint_df %>% 
+  slice_min(n = 10, score)
+```
+
+```{r}
+tot_constraint_df$ens <- ens(largest_comp_coauthor)
+
+tot_constraint_df %>% 
+  slice_max(n=10, ens)
+```
+
+## Correlation in Legitimacy
+
+```{r}
+node_large_comp <- 
+  node_info_sub %>% 
+  filter(component_member) %>% 
+  mutate(deg = degree(largest_comp_coauthor),
+         btw = igraph::betweenness(largest_comp_coauthor, 
+                           normalized = T, directed = F),
+         eigen = evcent(largest_comp_coauthor)$vector,
+         ens = ens(largest_comp_coauthor),
+         score = constraint(largest_comp_coauthor))
+```
+
+
+```{r}
+pairs <- 
+  node_large_comp %>%  
+  select(n, deg, btw, eigen, ens, score) %>% 
+  rename(n_paper = n, constraint = score) %>% 
+  ggpairs(axisLabels = "none",
+          upper = list(continuous = "points", combo = "box"),
+          lower = list(continuous = "cor", combo = "box"),
+          diag = list(continuous = "densityDiag")) + theme_bw()
+pairs
+```
+
+# Assortativity Coefficient
+
+```{r}
+# gender assortativity 
+V(w_graph_author)$male <- ifelse(node_info$gender == "male", 1, 0)
+
+w_graph_author_sub <- induced_subgraph(w_graph_author,
+                                V(w_graph_author)[!is.na(male)])
+
+assortativity_nominal(w_graph_author_sub, 
+              types = as.numeric(V(w_graph_author_sub)$male) + 1,
+              directed = F)
+```
+
+```{r}
+# degree assortavitity
+w_graph_author_sub <- induced_subgraph(w_graph_author,
+                                V(w_graph_author)[deg > 0])
+assortativity_degree(w_graph_author_sub, directed = F)
+```
+
+```{r}
+# ego_net <- make_ego_graph(w_graph_author_sub, order = 1)
+# 
+# assortativity_nominal(ego_net[[1]], 
+#                   types = as.numeric(V(ego_net[[1]])$male) + 1,
+#               directed = F)
+# 
+# V(ego_net[[1]])$male
+```
+
+# Prominent Scholar: Edward Miguel
+
+```{r}
+top_authors <- 
+  node_info %>% 
+  slice_max(n=20, btw) %>% 
+  pull(name)
+
+graph_author_top <- induced_subgraph(w_graph_author,
+                            V(w_graph_author)[name %in% top_authors])
+
+prominent_idx <- which(V(w_graph_author)$name == "Edward Miguel")
+miguel_graph <- make_ego_graph(w_graph_author, 
+               nodes = V(w_graph_author)[prominent_idx])[[1]]
+V(miguel_graph)$btw <- igraph::betweenness(miguel_graph, 
+                                           normalized = T, directed = F)
+V(miguel_graph)$deg <- degree(miguel_graph)
+miguel_graph_sub <- induced_subgraph(miguel_graph,
+                            V(miguel_graph)[deg > 10])
+miguel_graph_sub_df <- data.frame(
+  name = V(miguel_graph_sub)$name
+)
+```
+
+```{r fig.width=8, fig.height=8}
+ggraph(miguel_graph, layout = 'kk') + 
+  geom_edge_link(edge_alpha = 0.3) + 
+  geom_node_point(aes(size = btw, color=as.factor(male))) +
+  geom_node_label(aes(filter = deg > 6,
+                      label = name), repel = TRUE,
+                  size=3) + 
+  labs(size = "Betweenness Centrality", color = "Male") + 
+  #ggtitle("Ego Network of Edward Miguel") + 
+  theme(legend.position="bottom", legend.box = "vertical")
+ggsave("Miguel Ego.png")
+```
+
+```{r}
+# alter network
+miguel_graph_alter <- induced_subgraph(miguel_graph,
+                            V(miguel_graph)[name !=  "Edward Miguel"])
+
+components(miguel_graph_alter)
+```
+
+
+```{r}
+constraint_df <- data.frame(
+  names = names(constraint(miguel_graph)),
+)
+
+constraint_df$score <- constraint(miguel_graph)
+
+constraint_df %>% 
+  slice_min(n = 10, constraint_score)
+```
+
+
+# Scholar-Implementer Network
+
+```{r}
+# read in partnership data
+sch_imp_network <- 
+  read.csv("paper_author_list.csv") %>% 
+  filter(year >= 2019) %>% filter(year >= 2019 | month >= 6) %>% 
+  filter(!implementer %in% c("", "unidentified"), 
+         !affiliation %in% implementer) %>% 
+  select(affiliation, implementer)
+```
+
+```{r}
+# set node attributes
+sch_imp_g <- graph.data.frame(sch_imp_network)
+
+V(sch_imp_g)$type <- V(sch_imp_g)$name %in% sch_imp_network$affiliation
+V(sch_imp_g)$type <- ifelse(V(sch_imp_g)$type, 
+                            "Research Agency", "Implementer")
+V(sch_imp_g)$deg <- degree(sch_imp_g)
+```
+
+```{r}
+summary(sch_imp_g)
+table(V(sch_imp_g)$type)
+```
+
+```{r}
+# identify well-connected organization
+network_df <- data.frame(
+  org = V(sch_imp_g)$name,
+  type = V(sch_imp_g)$type,
+  deg = degree(sch_imp_g)
+)
+
+network_df %>%
+  group_by(type) %>%
+  slice_max(n=5, deg, with_ties=F) %>%
+  pull(org) -> prominent_org
+# remove one with long name
+prominent_org <- prominent_org[-3]
+```
+
+```{r}
+# extract the largest component
+components_imp <- components(sch_imp_g)
+idx_max_comp <- which.max(components_imp$csize)
+component_member <- components_imp$membership == idx_max_comp
+largest_comp <- induced_subgraph(sch_imp_g,
+                            V(sch_imp_g)[component_member])
+```
+
+
+```{r, fig.width=6, fig.height=6}
+# visualize
+ggraph(largest_comp, layout = "kk") + 
+  geom_edge_link(alpha = 0.5) + 
+  geom_node_point(aes(colour = type, shape = type, size=deg)) + 
+  geom_node_label(aes(filter=(name %in% prominent_org), 
+                              label = name), 
+                 repel = T, size = 3, label.padding = 0.15) + 
+  labs(size = "Degree") + 
+  #ggtitle("Research Institute and Implementer Network") + 
+  theme(legend.position="bottom", legend.box = "vertical")
+ggsave(filename = "Partnership.jpg")
+```
+
